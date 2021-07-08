@@ -88,12 +88,14 @@ func (l *IntList) Insert(value int) bool {
 	//5 unlock prev
 	prev.mu.Unlock()
 
+	//increase list's len
+	atomic.AddInt64(&l.length, 1)
+
 	return true
 }
 
 func (l *IntList) Delete(value int) bool {
 
-	//TODO
 	prev, cur := l.head, l.head.nextNode()
 
 	for {
@@ -133,6 +135,9 @@ func (l *IntList) Delete(value int) bool {
 	//unlock prev and cur
 	prev.mu.Unlock()
 	cur.mu.Unlock()
+
+	//desc list's len
+	atomic.AddInt64(&l.length, -1)
 
 	return true
 }
