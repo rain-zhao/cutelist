@@ -6,8 +6,8 @@ import (
 	"unsafe"
 )
 
-//IntList an struct of list order asc implement by linked list
-//note: list would not contain same value
+// IntList an struct of list order asc implement by linked list
+// note: list would not contain same value
 type IntList struct {
 	head   *intNode
 	length int64
@@ -16,79 +16,99 @@ type IntList struct {
 type intNode struct {
 	value  int
 	next   *intNode
-	marked bool
+	marked uint32
 	mu     sync.Mutex
 }
+
+const (
+	UNMARKED = iota
+	MARKED
+)
 
 func newIntNode(value int) *intNode {
 	return &intNode{value: value}
 }
 
-//nextNode load node's next node
-func (n *intNode) nextNode() *intNode {
+// loadNext load node's next node atomic
+func (n *intNode) loadNext() *intNode {
 	return (*intNode)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&n.next))))
 }
 
-// return one new list
+// storeNext store node's next node atomic
+func (n *intNode) storeNext(node *intNode) {
+	//same as n.next = node
+	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&n.next)), unsafe.Pointer(node))
+}
+
+// isMarked check node's marked
+func (n *intNode) isMarked() bool {
+	return atomic.LoadUint32(&n.marked) == 1
+}
+
+// setMarked set node's marked flag as flag
+func (n *intNode) setMarked(flag uint32) {
+	atomic.StoreUint32(&n.marked, flag)
+}
+
+// NewInt return one new list
 func NewInt() *IntList {
 	return &IntList{head: newIntNode(0)}
 }
 
-//Contains check whether value is in l
+// Contains check whether value is in l
 func (l *IntList) Contains(value int) bool {
 
 	cur := l.head
 
-	//skip dummy head
-	cur = cur.nextNode()
+	// skip dummy head
+	cur = cur.loadNext()
 
-	//find first appear of val
+	// find first appear of val
 	for cur != nil && cur.value < value {
-		cur = cur.nextNode()
+		cur = cur.loadNext()
 	}
 
-	return cur != nil && cur.value == value && !cur.marked
+	return cur != nil && cur.value == value && !cur.isMarked()
 }
 
-//Insert insert node of value into orderd list
+// Insert insert node of value into orderd list
 func (l *IntList) Insert(value int) bool {
 
-	prev, cur := l.head, l.head.nextNode()
+	var prev, cur *intNode
 
 	for {
-		//1: find the first node's val > value and its pre node
-		if cur != nil && cur.value < value {
-			prev = cur
-			cur = cur.nextNode()
-		}
+		// 1: find the pos
+		pprev, ccur, exist := l.find(value)
 
 		//value already exist
-		if cur != nil && cur.value == value {
+		if exist {
 			return false
 		}
 
-		//2.1 lock the prev node
-		prev.mu.Lock()
-		//2.2 check prev.next == cur and !prev.marked.
+		// 2.1 lock the prev node
+		pprev.mu.Lock()
+		// 2.2 check prev.next == cur and !prev.marked.
 		//no need to use nextNode() cause prev.next has been locked
-		if prev.next != cur || prev.marked {
-			prev.mu.Unlock()
+		if pprev.next != ccur || pprev.isMarked() {
+			pprev.mu.Unlock()
 			continue
 		}
 
+		prev, cur = pprev, ccur
 		break
 	}
 
-	//3 new node
+	// 3 new node
 	newNode := newIntNode(value)
 
-	//4 insert into list
-	prev.next, newNode.next = newNode, cur
+	// 4 insert into list
+	newNode.next = cur
+	prev.storeNext(newNode)
 
-	//5 unlock prev
+	// 5 unlock prev
 	prev.mu.Unlock()
 
-	//increase list's len
+	// increase list's len
 	atomic.AddInt64(&l.length, 1)
 
 	return true
@@ -96,68 +116,88 @@ func (l *IntList) Insert(value int) bool {
 
 func (l *IntList) Delete(value int) bool {
 
-	prev, cur := l.head, l.head.nextNode()
+	var prev, cur *intNode
 
 	for {
-		//1: find the node's val == value and its pre node
-		if cur != nil && cur.value < value {
-			prev = cur
-			cur = cur.nextNode()
-		}
+		// 1: find the pos
+		pprev, ccur, exist := l.find(value)
 
 		//value not exist
-		if cur == nil || cur.value != value {
+		if !exist {
 			return false
 		}
 
-		//2 lock cur and check cur.marked
-		cur.mu.Lock()
-		if cur.marked {
-			cur.mu.Unlock()
+		// 2 lock cur and check cur.marked
+		ccur.mu.Lock()
+		if ccur.isMarked() {
+			ccur.mu.Unlock()
 			continue
 		}
 
-		//3 lock prev and ckeck prev.next == cur and !prev.mark
-		prev.mu.Lock()
-		if prev.next != cur || prev.marked {
+		// 3 lock prev and ckeck prev.next == cur and !prev.mark
+		pprev.mu.Lock()
+		if pprev.next != ccur || pprev.isMarked() {
 			//unlock prev first
-			prev.mu.Unlock()
-			cur.mu.Unlock()
+			pprev.mu.Unlock()
+			ccur.mu.Unlock()
 			continue
 		}
+		prev, cur = pprev, ccur
 		break
 	}
 
-	//4 delete node from list
-	cur.marked = true
-	prev.next = cur.next
+	// 4 delete node from list
+	cur.setMarked(MARKED)
+	prev.storeNext(cur.next)
 
-	//unlock prev and cur
+	// unlock prev and cur
 	prev.mu.Unlock()
 	cur.mu.Unlock()
 
-	//desc list's len
+	// desc list's len
 	atomic.AddInt64(&l.length, -1)
 
 	return true
 }
 
-//Range iterate each node of l and put node.value as f's input param
+// Range iterate each node of l and put node.value as f's input param
 // if f return false then stop iteration
 func (l *IntList) Range(f func(value int) bool) {
 	cur := l.head
 
-	//skip dummy head
-	cur = cur.nextNode()
+	// skip dummy head
+	cur = cur.loadNext()
 
-	//iterate
-	//TODO  whether cur.marked would continue the iteration?
-	for cur != nil && !cur.marked && f(cur.value) {
-		cur = cur.nextNode()
+	// iterate
+	for cur != nil {
+		if cur.isMarked() {
+			cur = cur.loadNext()
+			continue
+		}
+		if !f(cur.value) {
+			break
+		}
+		cur = cur.loadNext()
 	}
 }
 
-//Len return length of l
+// Len return length of l
 func (l *IntList) Len() int {
 	return int(atomic.LoadInt64(&l.length))
+}
+
+// find find the node whose val == value and its pre node
+func (l *IntList) find(value int) (prev, cur *intNode, exist bool) {
+	prev, cur = l.head, l.head.loadNext()
+
+	for cur != nil && cur.value < value {
+
+		prev = cur
+		cur = cur.loadNext()
+	}
+
+	if cur != nil && cur.value == value {
+		exist = true
+	}
+	return
 }
